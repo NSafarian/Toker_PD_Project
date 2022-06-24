@@ -1,0 +1,633 @@
+---
+title: "Script4_DE Analysis Using EdgeR"
+author: "Nickie Safarian"
+date: "6/14/2022"
+output:
+  html_document: default
+  pdf_document: default
+---
+
+## R Markdown
+
+This script contains codes for analyzing Bulk RNA-seq data using edgeR package. Both general approach and GLM modeling are presented and the results from each method are compared at the end. 
+
+```{r, message=FALSE}
+# if (!require("BiocManager", quietly = TRUE))
+#     install.packages("BiocManager")
+# BiocManager::install(version = "3.15")
+
+# BiocManager::install("edgeR")
+# BiocManager::install("Limma")
+# BiocManager::install("Glimma")
+# install.packages('Rcpp')
+
+
+```
+
+## After you have installed edgeR, you load it like normal.
+```{r pressure, message=FALSE, include=FALSE}
+
+library(BiocManager)
+library(edgeR)
+library(tidyverse)
+library(dplyr)
+library(limma)
+library(Glimma)
+library(Rcpp)
+
+```
+
+## Input data
+```{r}
+
+counts <-  readRDS("/external/rprshnas01/kcni/nsafarian/Toker_PD_Project/pd_complex-i_stratification/Data/CountMatrix.Rds")
+
+metadataFinal <- read.csv("/external/rprshnas01/kcni/nsafarian/Toker_PD_Project/pd_complex-i_stratification/Data/Nickie/DESeq2/metadataFinal.csv")
+
+```
+
+
+## set rownames
+```{r}
+
+rownames(metadataFinal) <- metadataFinal$RNAseq_id_ParkOme2
+ 
+```
+
+## Prepare the count matrix
+```{r}
+# convert the count matrix into a dataframe and round the counts
+cts <- counts %>% as.data.frame %>% round()
+
+# only keep samples that have input in the metadataFinal
+cts.PD <- cts[ , metadataFinal$RNAseq_id_ParkOme2]
+ 
+```
+
+## Make sure that the columns of the count data are in the same order as rows names of the metadata*
+```{r}
+
+all(colnames(cts.PD) == rownames(metadataFinal)) # same order check
+all(colnames(cts.PD) %in% rownames(metadataFinal)) 
+                # same samples across two data
+
+```
+
+## Make DGE object
+### *1) Scale numerical covariates*
+```{r}
+
+metadataFinal$Age = scale(metadataFinal$Age)
+metadataFinal$PMI = scale(metadataFinal$PMI)
+metadataFinal$DV200 = scale(metadataFinal$DV200)
+metadataFinal$PropPos = scale(metadataFinal$PropPos)
+
+#1) Specifiy Age as a numeric covariate
+Age <- scale(metadataFinal$Age)
+#2) 
+PMI <- scale(metadataFinal$PMI)
+
+```
+
+### *2)Factor categoriacal covariates*
+```{r}
+
+#1) group by Mt.types
+group <- factor(metadataFinal$MT.Grouping, levels = c("NonMT_PD", "MT_PD"))
+
+#2) Specify sex for each of the samples
+Sex <- factor(metadataFinal$Sex, levels = c("M", "F"))
+
+#3) Specify Cohort groups for each of the samples
+Cohort <- factor(metadataFinal$Cohort2, levels = c("Norway", "Barcelona"))
+
+```
+
+### *3) Make DGE object*
+```{r}
+
+d.PD <- DGEList(counts=cts.PD, group=group)
+dim(d.PD) #60237 * 79
+
+class(d.PD) #"DGEList"/ #Print the characteristics of the DGE-list object x 
+
+```
+
+### *4) Add covariates to the DGE object*
+```{r}
+
+# Add grouping names columns to d.PD
+d.PD$samples$group <- group 
+
+# Add other covars to the matrix
+d.PD$samples$Age <- Age
+d.PD$samples$PMI <- PMI
+d.PD$samples$Sex <- Sex  
+d.PD$samples$Cohort <- Cohort  
+
+
+#Verify new columns successFinaly added by printing the samples dataframe
+d.PD$samples 
+
+```
+
+### *5) Annotation*
+```{r, include=FALSE}
+
+library(org.Hs.eg.db)  
+library(AnnotationDbi)
+
+
+gene.ids <-  AnnotationDbi::select(org.Hs.eg.db, rownames(d.PD), keytype="ENSEMBL",column="SYMBOL") #60469 genes
+
+#'select()' returned 1:many mapping between keys and columns  
+
+# Chck for duplicated entries  
+sum(duplicated(gene.ids$ENSEMBL))
+#[1] 232
+
+#remove duplicated ones
+gene.ids <- gene.ids[!duplicated(gene.ids$ENSEMBL),] 
+
+#check rownames in DGE object matches the genes ids 
+identical(gene.ids$ENSEMBL,rownames(d.PD))
+#[1] TRUE
+
+d.PD$genes <- gene.ids
+
+```
+
+## Transform data from the raw scale
+```{r}
+
+# keep a copy of object in case something went wrong
+d.PD2= d.PD
+
+#calculate count.per.million
+CPM <- cpm(d.PD) #Calculate counts per million for x
+lcpm <- cpm(d.PD, log=TRUE) #Calculate log2[cpm + 2/L]
+
+L <- mean(d.PD$samples$lib.size) * 1e-6 #Calculate mean library size 
+          #(Units= x millions of reads)
+M <- median(d.PD$samples$lib.size) * 1e-6 #Calculate median library size 
+          #(Units= x millions of reads)
+
+c(L, M)
+
+# 81.10790 , 78.37889
+#note that L= 81.1 M and log2(2/81.1)= log2(0.0246)=-5.3, this means a count of zero for this data maps to a log-CPM value of −5.3 after adding the prior count or offset.
+
+```
+
+## Filter the data
+the filtering keeps genes that have count-per-million (CPM) above k in n samples, where k is determined by #min.count and by the sample library sizes and n is determined by the design matrix.
+
+```{r}
+
+# Gene expression = 0. Let's check how many genes in sample 59 have 
+# expression =0?
+
+# table(rowSums(d.PD$counts==0)==59) #Print numbers of genes with
+#gene expression =0 across all samples (TRUE) and 
+#number of genes with gene expression >0 in at least
+#one sample (FALSE)/  TRUE 11773 / FALSE 48464 
+ 
+
+#Filter out lowly expressed genes
+
+#Note: Derfault filter setting = all genes 
+#with >10 counts in a mimumum number of samples
+#The minimum number of samples is chosen based on 
+#the minimum group sample size.
+keep.exprs <- filterByExpr(d.PD, group=group) #Filter out 
+          #lowly expressed genes, keeping only those above
+          #defined filtering thresholds
+
+d.PD.f <- d.PD[keep.exprs, keep.lib.sizes=FALSE] #Write the new subset of data
+          #above filter thresholds, stored in keep.expres, to x
+
+dim(d.PD.f) # 25661  *  74  
+
+
+#=============Another method for filtering===================
+# keep <- rowSums(cpm(d.PD)>100) >= 2
+# d.PD.f <- d.PD.f[keep,]
+# dim(d.PD.f)
+
+```
+
+## Plot log-cpm before and after filtering
+```{r}
+
+lcpm.cutoff <- log2(10/M + 2/L) #Define cutoff for log-cpm values
+# here lcpm.cutoff = -2.715544
+
+# Define samples names
+samplenames <- colnames(d.PD)
+
+library(RColorBrewer)
+nsamples <- ncol(d.PD)
+col <- colorRampPalette(brewer.pal(8, "Set2"))(nsamples)
+
+par(mfrow=c(1,2))
+plot(density(lcpm[,1]), col=col[1], lwd=2, ylim=c(0,0.5), las=2, main="", xlab="")
+title(main="A. Raw data", xlab="Log-cpm")
+abline(v=lcpm.cutoff, lty=3)
+for (i in 2:nsamples){
+  den <- density(lcpm[,i])
+} 
+lines(den$x, den$y, col=col[i], lwd=2)
+
+lcpm.f <- cpm(d.PD.f, log=TRUE)
+plot(density(lcpm.f[,1]), col=col[1], lwd=2, ylim=c(0,0.2), las=2, main="", xlab="")
+title(main="B. Filtered data", xlab="Log-cpm")
+abline(v=lcpm.cutoff, lty=3)
+for (i in 2:nsamples){
+  den.f <- density(lcpm.f[,i])
+} 
+lines(den.f$x, den.f$y, col=col[i], lwd=2)
+
+
+
+```
+
+## After filtering, it is a good idea to reset the library sizes:
+```{r}
+
+d.PD.f$samples$lib.size <- colSums(d.PD.f$counts)
+d.PD.f$samples
+
+```
+
+## Normalizing the data
+```{r}
+
+# Normalization is required to ensure that the expression distributions of each sample are similar across the entire experiment.
+d.PD.f <- calcNormFactors(d.PD.f, method = "TMM") 
+          #Normalize data by Trimmed Mean M-values (TMM) 
+
+
+# to access the values run: d.PD.f$samples$norm.factors
+
+```
+
+## Data exploration
+### *Unsupervised clustering of samples*
+First generate a multi-dimensional scaling (MDS) plot to conduct unsupervised clustering of samples **before filtering**.
+```{r}
+
+plotMDS(d.PD.f, method="bcv", col=as.numeric(d.PD.f$samples$group))
+legend("topright" , as.character(unique(d.PD.f$samples$group)), col=1:3, pch=20)
+
+#Note that the different types are supposed to separate out nicely.
+
+```
+
+Next, generate a multi-dimensional scaling (MDS) plot to conduct unsupervised clustering of **filtered samples**. 
+```{r}
+#Dimensions 1 and 2 are examined first using colour grouping defined by MT.types
+
+lcpm.f <- cpm(d.PD.f, log=TRUE)
+par(mfrow=c(1,2))
+col.group <- group
+levels(col.group) <-  c("grey", "seagreen")
+col.group <- as.character(col.group)
+col.sex <- Sex
+levels(col.sex) <-  c("pink", "blue")
+col.sex <- as.character(col.sex)
+plotMDS(lcpm.f, labels=group, col=col.group)
+title(main="A. Sample MT.groups")
+plotMDS(lcpm.f, labels=Sex, col=col.sex, dim=c(1,2))
+title(main="B. Samples Sex")
+
+#Dimensions 3 and 4 are examined next using dim()
+
+```
+
+## Estimating the Dispersion
+```{r}
+d.PD.f <- estimateCommonDisp(d.PD.f, verbose=T)
+names(d.PD.f)
+d.PD.f$common.dispersion # 0.1704014
+
+
+#For routine differential expression analysis, we use empirical Bayes tagwise dispersions. After common dispersion was calculated run:
+d.PD.f <- estimateTagwiseDisp(d.PD.f)
+names(d.PD.f)
+
+```
+
+## Plot the tagwise biological coefficient of variation (square root of dispersions) against log2-CPM.
+```{r}
+
+plotBCV(d.PD.f)
+
+```
+
+## GLM estimates of dispersion 
+Generalized linear models (GLMs) are an extension of classical linear models to non-normally distributed response data. It allows for more complex designs.
+### *Step 1)Design a model matrix*
+
+```{r}
+# Method 1:
+# We need to adjust for baseline differences between the patients, so the 
+# first step is to initialize the design matrix with sample effects:
+# design <- model.matrix(~ 0+group)
+# 
+# #Then we define disease-specific treatment effects and append them to the design matrix:
+# design <- cbind(design, Age, PMI, Cohort, Sex)
+# colnames(design) <- gsub("group", "", colnames(design))
+# head(design)
+
+#===============================================================
+## Method 2:
+# We need to adjust for baseline differences between the patients, so the first step is to initialize the design matrix with patient effects:
+design <- model.matrix(~ 0+ group + Sex + group*Sex + Age+ PMI+ Cohort)
+
+
+rownames(design) <- colnames(d.PD)
+
+#Then we define disease-specific treatment effects and append them to the design matrix:
+colnames(design) <- gsub("group", "", colnames(design))
+colnames(design)
+
+```
+
+### *Step2) Define contrasts for pairwise comparisons*
+```{r}
+
+# Note : You can define contrast first then fit a model or you can skip designing the contarst matrix at this step.
+
+# contr.matrix <- makeContrasts(
+#   NonMT.vs.MT = NonMT_PD - MT_PD,  #????? Doesn't work, DONT KNOW WHY?
+#   levels = colnames(design))
+# 
+# 
+# contr.matrix 
+
+```
+
+### *Step3) Estimate GLM Dispersion*
+```{r}
+
+d.PD.f <- estimateGLMCommonDisp(d.PD.f,design)
+d.PD.f <- estimateGLMTrendedDisp(d.PD.f,design, method="power")
+# You can change method to "auto", "bin.spline", "power", "spline", 
+# "bin.loess". The default is "auto" which chooses "bin.spline" when > 200 tags # and "power" otherwise.
+
+
+d.PD.f <- estimateGLMTagwiseDisp(d.PD.f,design)
+plotBCV(d.PD.f)
+
+```
+
+## Testing for differential expression (DE)
+Once the dispersion is estimated, we can proceed with detecting differential expression patterns.
+
+## *Method 1:General Approach*
+```{r}
+et.12 <- exactTest(d.PD.f, pair=c(1,2)) # compare groups NMT_PD and MT_PD
+
+topTags(et.12, n=10)
+
+
+```
+
+The total number of differentially expressed genes at FDR< 0:05 is:
+```{r}
+
+de.1 <- decideTestsDGE(et.12, adjust.method="BH", p.value=0.05)
+
+summary(de.1) # Down 6317 /  Up 7439
+
+```
+
+Here the entries for -1, 0 and 1 are for down-regulated, non-differentially expressed and up-regulated tags respectively.
+
+```{r}
+
+de1tags12.PD <- rownames(d.PD.f)[as.logical(de.1)] 
+
+plotSmear(et.12, de.tags=de1tags12.PD)  # generates a plot
+abline(h = c(-1, 1), col = "blue")      # of the tagwise log-fold-changes                                         # against log-cpm                     
+```
+
+
+### save the sigs.results
+```{r}
+et.12.df <- as.data.frame(et.12)
+rownames(et.12.df) <- et.12.df$ENSEMBL
+et.12.df.sigs <- et.12.df[rownames(d.PD.f)[as.logical(de.1)] , ]
+
+write.csv(et.12.df, "DEG.all.Results.EdgeR.general.method.csv")
+write.csv(et.12.df, "DEG.sigs.Results-padj0.05-EdgeR.general.method.csv")
+```
+
+## *Method 2: GLM testing for differential expression*
+Just as we used a GLM to fit the trend line above, we can also use this in finding the tags that are interesting by using a likelihood ratio test.
+```{r}
+
+# generate a second copy of DGE object
+d.PD.f2 =d.PD.f
+
+# to fit a model, GLM uses the defined design  
+fit <- glmFit(d.PD.f2, design)
+
+# compare (group 1 - group 2) to 0:
+# this is equivalent to comparing group 1 to group 2
+lrt1.2 <- glmLRT(fit, contrast=c(1,-1, 0, 0, 0, 0, 0))
+
+topTags(lrt1.2, n=10)
+
+#Note that glmLRT has conducted a test for the last coefficient in the linear model, which we can see is the Sex effect:
+#  colnames(design)
+# "NonMT_PD"  "MT_PD"   "SexF"   "Age"   "DV200"          
+# "CohortBarcelona"     "MT_PD:SexF" 
+
+```
+
+```{r}
+
+de.2 <- decideTestsDGE(lrt1.2, adjust.method="BH", p.value = 0.05)
+de2tags12.PD <- rownames(d.PD.f2)[as.logical(de.2)]
+plotSmear(lrt1.2, de.tags=de2tags12.PD)
+abline(h = c(-2, 2), col = "blue")
+
+```
+
+### save the sigs.results
+```{r}
+Irt1.2.df <- as.data.frame(lrt1.2)
+rownames(Irt1.2.df) <- Irt1.2.df$ENSEMBL
+Irt1.2.df.sigs <- Irt1.2.df[rownames(d.PD.f2)[as.logical(de.2)] , ]
+
+write.csv(Irt1.2.df, "DEG.all.Results.GlmLRT.method.csv")
+write.csv(Irt1.2.df.sigs, "DEG.sigs.Results-padj0.05-GlmLRT.method.csv")
+```
+
+## *Method 3: GLMQL testing for differential expression*
+```{r}
+
+fit.2 <- glmQLFit(d.PD.f2, design)
+
+plotQLDisp(fit.2)
+
+```
+
+```{r}
+
+qlf.Mito <- glmQLFTest(fit.2, contrast=c(-1,1,0,0,0,0,0)) 
+                       #Coefficient:  -1*NonMT_PD 1*MT_PD
+
+# another way to set this contrast is to use coef number:
+# qlf <- glmQLFTest(fit, coef=1: 2) #1 is NonMT_PD and 2 is MT_PD
+
+```
+
+
+```{r}
+
+# To find genes that express differentially based on interaction between sex and Mito-type covariates*
+qlf.Sex.intr.Mito <- glmQLFTest(fit.2, coef=7)# Coefficient:  "MT_PD:SexF"  
+
+```
+
+
+```{r}
+
+# Summary of sig. results for mito-types
+topTags(qlf.Mito)
+FDR <- p.adjust(qlf.Mito$table$PValue, method="BH")
+sum(FDR < 0.05)  #10258
+summary(decideTests(qlf.Mito))
+
+```
+
+```{r}
+
+# Summary of sig. results for the interaction term
+topTags(qlf.Sex.intr.Mito)
+FDR <- p.adjust(qlf.Sex.intr.Mito$table$PValue, method="BH")
+sum(FDR < 0.05)  
+summary(decideTests(qlf.Sex.intr.Mito))
+
+```
+
+### save the sigs.results
+```{r}
+qlf.Mito.df <- as.data.frame(qlf.Mito)
+write.csv(qlf.Mito.df, "DEG.Results.glmQLFit.method.csv")
+
+```
+
+
+## *Method 4: use Limma to generate linear model and voom plot without voom precision weights*
+```{r}
+
+library(limma) #Load limma 
+library(edgeR) #Load edgeR
+
+# x is the DGE object , here we called it d.PD
+#function
+v <- voom(d.PD.f, design, plot=TRUE)
+
+```
+
+### Plots of variance vs. mean here will now
+```{r}
+
+#have voom-generated precision weights incorporated into the generation of the plot
+
+vfit <- lmFit(v, design=design)
+vfit <- contrasts.fit(vfit, contrast=c(-1,1,0,0,0,0,0)) 
+efit <- eBayes(vfit)
+plotSA(efit)
+
+```
+
+### Examine the number of differentially expressed genes 
+```{r}
+
+#Print out a summary of the numbers of upregulated
+          #and downregrulated genes using:
+          #a) P-value cutoff (default P<0.05)
+
+summary(decideTests(efit))  # shows 0 genes
+
+```
+
+### Print out a summary of the numbers of upregulated and downregrulated genes using:
+```{r}
+         
+#a) P-value cutoff (default P<0.05)
+#b) minimum log-FC requirement --> lfc=0.25
+
+tfit <- treat(vfit, lfc=0.25) 
+dt <- decideTests(tfit) 
+summary(dt)
+
+```
+
+### List the most significantly differentially expressed genes (smallest to largest adjusted P) 
+```{r}
+          #from results of differential 
+          #expression analysis using the "eBayes" function
+          
+
+NonMT.vs.MT <- topTable(efit, coef=1, n=Inf) 
+ 
+head(NonMT.vs.MT)
+
+
+```
+
+### save the results
+```{r}
+
+NonMT.vs.MT.sigs <- NonMT.vs.MT %>% subset(NonMT.vs.MT$adj.P.Val <0.05)
+
+write.csv(NonMT.vs.MT.sigs, "DEG.sigs.Results.Limma.Voom.method.csv")
+
+```
+
+
+### GRAPHICALLY REPRESENT DIFFERENTIAL EXPRESSION ANALYSIS DATA             
+```{r}
+#Mean Difference (MD) Plot 
+#(logFC vs. log-cpm)
+
+#Note: Differentially expressed genes are highlighted
+#in the plot.
+
+plotMD(tfit, column=1, status=dt[,1], main=colnames(tfit)[1],
+       xlim=c(-8,13))
+
+```
+
+## Heatmap
+```{r,message=FALSE, error=FALSE}
+
+# library(gplots)
+# 
+# NonMT.vs.MT.topgenes <- NonMT.vs.MT$ENSEMBL[1:100]
+# i <- which(v$genes$ENSEMBL %in% NonMT.vs.MT.topgenes)
+# mycol <- colorpanel(1000,"blue","white","red")
+# heatmap.2(lcpm.f[i,], scale="row",
+#           labRow=v$genes$SYMBOL[i], labCol=group,
+#           col=mycol, trace="none", density.info="none",
+#           margin=c(0.5,0.5),
+#           dendrogram="column")
+
+
+# If an error poped for the margins being too large , do this:
+# in console type par("mar") --> it'll show 5.1 4.1 4.1 2.1, 
+# now, set the image margin to this par(mar=c(0.1,0.1,0.1,0.1))
+
+# If that didn't worked use dev.off()
+
+# If dev.off returned errors use, dev.set(dev.next())
+
+```
+
+
+
